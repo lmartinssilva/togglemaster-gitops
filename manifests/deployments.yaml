@@ -201,7 +201,7 @@ spec:
     spec:
       containers:
         - name: analytics-service
-          image: 451240578553.dkr.ecr.us-east-1.amazonaws.com/analytics-service:v1.0.0-a0fb013
+          image: 451240578553.dkr.ecr.us-east-1.amazonaws.com/analytics-service:
           ports:
             - containerPort: 8005
           resources:
