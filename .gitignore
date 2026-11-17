@@ -1,0 +1,5 @@
+# Segredos: nunca versionar
+secrets.yaml
+observability-keys.env
+*.env
+!*.env.example

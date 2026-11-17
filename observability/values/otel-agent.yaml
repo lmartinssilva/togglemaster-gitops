@@ -1,0 +1,30 @@
+# OTel Collector "agent": 1 por no (DaemonSet). Le os logs de TODOS os containers
+# do cluster (/var/log/pods) e encaminha ao gateway, que os entrega ao Loki.
+mode: daemonset
+fullnameOverride: otel-agent
+
+image:
+  repository: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib
+command:
+  name: otelcol-contrib
+
+presets:
+  logsCollection:
+    enabled: true
+    includeCollectorLogs: false
+  # Enriquece cada log com namespace, pod, container, deployment (viram labels no Loki)
+  kubernetesAttributes:
+    enabled: true
+
+resources:
+  requests: { cpu: 50m, memory: 128Mi }
+  limits: { cpu: 300m, memory: 256Mi }
+
+config:
+  exporters:
+    otlphttp/gateway:
+      endpoint: http://otel-gateway.monitoring.svc.cluster.local:4318
+  service:
+    pipelines:
+      logs:
+        exporters: [otlphttp/gateway]

@@ -1,0 +1,329 @@
+# Self-healing: webhook receiver que reinicia Deployments (equivale a `kubectl rollout restart`).
+# O script fica em healer.py (fonte) e embutido no ConfigMap abaixo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: self-healer-script
+  namespace: monitoring
+data:
+  healer.py: |
+    """Self-healing: recebe o webhook do Grafana Alerting e reinicia o Deployment afetado.
+
+    Equivale a `kubectl rollout restart deployment/<nome>`: aplica um PATCH na API do
+    Kubernetes alterando a annotation kubectl.kubernetes.io/restartedAt do pod template,
+    o que dispara um rolling update (sem downtime, pois sobem pods novos antes de matar os antigos).
+
+    Segurança (princípio do menor privilégio):
+      * ServiceAccount com Role que só permite get/list/patch em Deployments do namespace alvo
+      * só atua em Deployments da allowlist e em alertas com label remediation=restart-deployment
+      * token compartilhado com o Grafana (REMEDIATOR_TOKEN)
+      * cooldown por Deployment: evita loop de restarts caso o alerta continue disparando
+    """
+    import hmac
+    import json
+    import os
+    import ssl
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    TOKEN = os.environ.get("REMEDIATOR_TOKEN", "")
+    NAMESPACE = os.environ.get("TARGET_NAMESPACE", "togglemaster")
+    ALLOWED = {d.strip() for d in os.environ.get(
+        "ALLOWED_DEPLOYMENTS",
+        "auth-service,flag-service,targeting-service,evaluation-service,analytics-service").split(",")}
+    COOLDOWN = int(os.environ.get("COOLDOWN_SECONDS", "180"))
+    SLACK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+    PORT = int(os.environ.get("PORT", "8080"))
+    SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+    KUBE_API = os.environ.get("KUBE_API_URL") or "https://{}:{}".format(
+        os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc"),
+        os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
+
+    _last_action = {}
+    _history = []
+    _lock = threading.Lock()
+
+
+    def log(msg):
+        print("{} [self-healer] {}".format(datetime.now(timezone.utc).isoformat(timespec="seconds"), msg), flush=True)
+
+
+    def kube(method, path, body=None, content_type="application/json"):
+        headers = {"Accept": "application/json"}
+        ctx = None
+        if KUBE_API.startswith("https"):
+            with open(os.path.join(SA_DIR, "token")) as f:
+                headers["Authorization"] = "Bearer " + f.read().strip()
+            ctx = ssl.create_default_context(cafile=os.path.join(SA_DIR, "ca.crt"))
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = content_type
+        req = urllib.request.Request(KUBE_API + path, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:  # nosec B310
+            return json.loads(resp.read() or b"{}")
+
+
+    def notify_slack(text):
+        if not SLACK_URL:
+            return
+        try:
+            req = urllib.request.Request(
+                SLACK_URL, data=json.dumps({"text": text}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=10).read()  # nosec B310
+        except Exception as exc:  # notificar nunca pode quebrar a remediação
+            log("aviso: falha ao notificar o Slack: {}".format(exc))
+
+
+    def rollout_restart(name):
+        path = "/apis/apps/v1/namespaces/{}/deployments/{}".format(NAMESPACE, name)
+        patch = {"spec": {"template": {"metadata": {"annotations": {
+            "kubectl.kubernetes.io/restartedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}}}}}
+        kube("PATCH", path, patch, "application/strategic-merge-patch+json")
+
+
+    def wait_rollout(name, timeout=180):
+        path = "/apis/apps/v1/namespaces/{}/deployments/{}".format(NAMESPACE, name)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            d = kube("GET", path)
+            want = d["spec"].get("replicas", 1)
+            st = d.get("status", {})
+            if (st.get("observedGeneration", 0) >= d["metadata"]["generation"]
+                    and st.get("updatedReplicas", 0) == want
+                    and st.get("availableReplicas", 0) == want
+                    and st.get("replicas", 0) == want):
+                return True
+            time.sleep(3)
+        return False
+
+
+    def heal(name, alertname):
+        started = time.time()
+        log("ALERTA RECEBIDO: '{}' -> executando: kubectl rollout restart deployment/{} -n {}".format(
+            alertname, name, NAMESPACE))
+        try:
+            rollout_restart(name)
+            log("SELF-HEALING EXECUTADO: rollout restart de deployment/{} solicitado ao Kubernetes".format(name))
+            notify_slack(":robot_face: *Self-healing executado* — `kubectl rollout restart deployment/{}` "
+                         "(namespace `{}`) disparado pelo alerta _{}_.".format(name, NAMESPACE, alertname))
+            ok = wait_rollout(name)
+            took = int(time.time() - started)
+            if ok:
+                log("RECUPERADO: deployment/{} com todas as réplicas novas disponíveis em {}s".format(name, took))
+                notify_slack(":white_check_mark: deployment/{} reiniciado e saudável em {}s.".format(name, took))
+            else:
+                log("ATENÇÃO: rollout de deployment/{} não concluiu em 180s".format(name))
+            result = "ok" if ok else "timeout"
+        except Exception as exc:
+            log("ERRO ao reiniciar deployment/{}: {}".format(name, exc))
+            result = "erro: {}".format(exc)
+        with _lock:
+            _history.append({"time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                             "deployment": name, "alert": alertname, "result": result})
+            del _history[:-50]
+
+
+    def handle_alerts(payload):
+        started = []
+        for alert in payload.get("alerts", []):
+            labels = alert.get("labels", {})
+            if alert.get("status") != "firing":
+                continue  # alerta resolvido: nada a fazer
+            if labels.get("remediation") != "restart-deployment":
+                log("alerta '{}' sem label remediation=restart-deployment: ignorado".format(labels.get("alertname")))
+                continue
+            name = labels.get("deployment") or labels.get("service", "")
+            if name not in ALLOWED:
+                log("deployment '{}' fora da allowlist: ignorado".format(name))
+                continue
+            with _lock:
+                since = time.time() - _last_action.get(name, 0)
+                if since < COOLDOWN:
+                    log("cooldown: deployment/{} já foi reiniciado há {}s (mínimo {}s): ignorado".format(
+                        name, int(since), COOLDOWN))
+                    continue
+                _last_action[name] = time.time()
+            threading.Thread(target=heal, args=(name, labels.get("alertname", "?")), daemon=True).start()
+            started.append(name)
+        return started
+
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self):
+            url = urlparse(self.path)
+            given = parse_qs(url.query).get("token", [""])[0]
+            header = self.headers.get("Authorization", "")
+            if header.startswith("Bearer "):
+                given = header[7:]
+            return bool(TOKEN) and hmac.compare_digest(given, TOKEN)
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/health":
+                self._send(200, {"status": "ok"})
+            elif path == "/history":
+                with _lock:
+                    self._send(200, {"actions": list(_history)})
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if urlparse(self.path).path != "/webhook":
+                return self._send(404, {"error": "not found"})
+            if not self._authorized():
+                log("webhook recusado: token inválido")
+                return self._send(401, {"error": "unauthorized"})
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return self._send(400, {"error": "json inválido"})
+            self._send(200, {"restarting": handle_alerts(payload)})
+
+        def log_message(self, fmt, *args):  # silencia o log por request (probes)
+            pass
+
+
+    if __name__ == "__main__":
+        if not TOKEN:
+            raise SystemExit("REMEDIATOR_TOKEN não definido")
+        log("iniciado: namespace alvo={} allowlist={} cooldown={}s".format(NAMESPACE, sorted(ALLOWED), COOLDOWN))
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: self-healer
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: self-healer
+  namespace: togglemaster
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: self-healer
+  namespace: togglemaster
+subjects:
+- kind: ServiceAccount
+  name: self-healer
+  namespace: monitoring
+roleRef:
+  kind: Role
+  name: self-healer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: self-healer
+  namespace: monitoring
+  labels:
+    app: self-healer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: self-healer
+  template:
+    metadata:
+      labels:
+        app: self-healer
+    spec:
+      serviceAccountName: self-healer
+      containers:
+      - name: self-healer
+        image: python:3.12-slim
+        command:
+        - python
+        - -u
+        - /app/healer.py
+        ports:
+        - containerPort: 8080
+        env:
+        - name: REMEDIATOR_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: grafana-alert-secrets
+              key: REMEDIATOR_TOKEN
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: grafana-alert-secrets
+              key: SLACK_WEBHOOK_URL
+              optional: true
+        - name: TARGET_NAMESPACE
+          value: togglemaster
+        - name: COOLDOWN_SECONDS
+          value: '180'
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 20
+          initialDelaySeconds: 10
+        resources:
+          requests:
+            cpu: 20m
+            memory: 48Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: script
+          mountPath: /app
+      volumes:
+      - name: script
+        configMap:
+          name: self-healer-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: self-healer
+  namespace: monitoring
+spec:
+  selector:
+    app: self-healer
+  ports:
+  - port: 8080
+    targetPort: 8080

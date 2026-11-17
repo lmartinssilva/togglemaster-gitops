@@ -1,0 +1,82 @@
+# OTel Collector "gateway": ponto central para onde os microsservicos enviam
+# traces e metricas (OTLP). Processa e roteia:
+#   traces  -> Datadog (APM / Service Map) + spanmetrics (gera metricas RED)
+#   metricas-> Prometheus (remote write)
+#   logs    -> Loki (OTLP nativo)
+mode: deployment
+fullnameOverride: otel-gateway
+replicaCount: 1
+
+# A distribuicao "contrib" e necessaria (exporter datadog, connector spanmetrics)
+image:
+  repository: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib
+command:
+  name: otelcol-contrib
+
+# DD_API_KEY e DD_SITE vem de um Secret criado fora do Git
+extraEnvsFrom:
+  - secretRef:
+      name: datadog-credentials
+
+resources:
+  requests: { cpu: 100m, memory: 192Mi }
+  limits: { cpu: 500m, memory: 512Mi }
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: ${env:MY_POD_IP}:4317
+        http:
+          endpoint: ${env:MY_POD_IP}:4318
+  processors:
+    memory_limiter:
+      check_interval: 5s
+      limit_percentage: 80
+      spike_limit_percentage: 25
+    batch: {}
+    resource/env:
+      attributes:
+        - key: deployment.environment
+          value: fase4
+          action: upsert
+  connectors:
+    # Transforma traces em metricas: traces_span_metrics_calls_total e
+    # traces_span_metrics_duration_milliseconds_* (base do dashboard e do alerta de 5xx)
+    spanmetrics:
+      histogram:
+        explicit:
+          buckets: [50ms, 100ms, 250ms, 500ms, 1s, 2500ms, 5s]
+      metrics_flush_interval: 15s
+    # Calcula as estatisticas de APM que alimentam o Service Map do Datadog
+    datadog/connector: {}
+  exporters:
+    datadog:
+      api:
+        site: ${env:DD_SITE}
+        key: ${env:DD_API_KEY}
+    prometheusremotewrite:
+      endpoint: http://kps-prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+      resource_to_telemetry_conversion:
+        enabled: true
+    otlphttp/loki:
+      endpoint: http://loki.monitoring.svc.cluster.local:3100/otlp
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, resource/env, batch]
+        exporters: [spanmetrics, datadog/connector, datadog]
+      metrics:
+        receivers: [otlp, spanmetrics]
+        processors: [memory_limiter, batch]
+        exporters: [prometheusremotewrite]
+      metrics/datadog:
+        receivers: [datadog/connector]
+        processors: [batch]
+        exporters: [datadog]
+      logs:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlphttp/loki]

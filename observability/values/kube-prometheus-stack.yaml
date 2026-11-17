@@ -1,0 +1,60 @@
+# Prometheus (metricas) + Grafana (visualizacao e alertas). Sem Alertmanager:
+# os alertas sao gerenciados pelo proprio Grafana (contact points -> PagerDuty/Slack/webhook).
+fullnameOverride: kps
+
+# EKS gerenciado nao expoe esses componentes; sem isto viram alertas falsos "target down".
+kubeEtcd: { enabled: false }
+kubeControllerManager: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeProxy: { enabled: false }
+alertmanager: { enabled: false }
+defaultRules:
+  create: true
+  rules:
+    alertmanager: false
+    etcd: false
+    kubeControllerManager: false
+    kubeProxy: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+
+prometheus:
+  prometheusSpec:
+    # O OTel Collector EMPURRA metricas via remote write (API /api/v1/write).
+    enableRemoteWriteReceiver: true
+    # Sem EBS CSI no cluster -> sem PVC: armazenamento efemero (emptyDir) de proposito.
+    retention: 12h
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    resources:
+      requests: { cpu: 200m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+
+grafana:
+  defaultDashboardsTimezone: America/Sao_Paulo
+  # Senha vem de um Secret criado fora do Git (observability/scripts/create-secrets.sh)
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  # Chaves do PagerDuty/Slack/webhook, referenciadas nos contact points como $VAR
+  envFromSecrets:
+    - name: grafana-alert-secrets
+      optional: true
+  sidecar:
+    # Carrega contact points / politicas / regras de alerta de ConfigMaps com label grafana_alert
+    alerts:
+      enabled: true
+    datasources:
+      alertmanager:
+        enabled: false
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      uid: loki
+      access: proxy
+      url: http://loki.monitoring.svc.cluster.local:3100
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }

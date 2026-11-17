@@ -1,0 +1,102 @@
+# Alerting as code: contact points (PagerDuty + Slack + webhook de self-healing), politica e regra.
+# O Grafana substitui $PAGERDUTY_INTEGRATION_KEY etc. pelas variaveis de ambiente (Secret grafana-alert-secrets).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-alerting-togglemaster
+  namespace: monitoring
+  labels:
+    grafana_alert: '1'
+data:
+  contactpoints.yaml: |
+    apiVersion: 1
+    contactPoints:
+      - orgId: 1
+        name: togglemaster-oncall
+        receivers:
+          # 1) PagerDuty: abre o incidente (Events API v2)
+          - uid: cp-pagerduty
+            type: pagerduty
+            settings:
+              integrationKey: $PAGERDUTY_INTEGRATION_KEY
+              severity: critical
+              class: http-5xx
+              component: auth-service
+              group: togglemaster
+              summary: '{{ .CommonAnnotations.summary }}'
+            disableResolveMessage: false
+          # 2) Slack (ChatOps): notifica o time
+          - uid: cp-slack
+            type: slack
+            settings:
+              url: $SLACK_WEBHOOK_URL
+              title: '{{ if eq .Status "firing" }}:rotating_light: ALERTA{{ else }}:white_check_mark: RESOLVIDO{{ end }} - {{ .CommonLabels.alertname }}'
+              text: |-
+                {{ range .Alerts }}*{{ .Annotations.summary }}*
+                {{ .Annotations.description }}
+                Servico: {{ .Labels.service }} | Severidade: {{ .Labels.severity }}
+                {{ end }}
+            disableResolveMessage: false
+          # 3) Webhook interno: aciona o self-healing (rollout restart)
+          - uid: cp-selfhealer
+            type: webhook
+            settings:
+              url: http://self-healer.monitoring.svc.cluster.local:8080/webhook?token=$REMEDIATOR_TOKEN
+              httpMethod: POST
+            disableResolveMessage: true
+  policies.yaml: |
+    apiVersion: 1
+    policies:
+      - orgId: 1
+        receiver: togglemaster-oncall
+        group_by: ['alertname', 'service']
+        group_wait: 10s
+        group_interval: 1m
+        repeat_interval: 4h
+  rules.yaml: |
+    apiVersion: 1
+    groups:
+      - orgId: 1
+        name: togglemaster-slo
+        folder: ToggleMaster
+        interval: 30s
+        rules:
+          - uid: auth-service-5xx-rate
+            title: auth-service com taxa de erros 5xx acima de 5%
+            condition: C
+            data:
+              - refId: A
+                relativeTimeRange: {from: 300, to: 0}
+                datasourceUid: prometheus
+                model:
+                  refId: A
+                  editorMode: code
+                  instant: true
+                  intervalMs: 1000
+                  maxDataPoints: 43200
+                  # taxa de erros 5xx / total de requests, calculada sobre as metricas geradas dos traces (spanmetrics).
+                  # "and total > 0.2": guarda de trafego minimo (ignora poucos requests) para evitar alert fatigue.
+                  expr: '((sum(rate(traces_span_metrics_calls_total{service_name="auth-service",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}[1m]))) or vector(0)) / (sum(rate(traces_span_metrics_calls_total{service_name="auth-service",span_kind="SPAN_KIND_SERVER"}[1m]))) and (sum(rate(traces_span_metrics_calls_total{service_name="auth-service",span_kind="SPAN_KIND_SERVER"}[1m]))) > 0.2'
+              - refId: B
+                datasourceUid: __expr__
+                model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+              - refId: C
+                datasourceUid: __expr__
+                model:
+                  refId: C
+                  type: threshold
+                  expression: B
+                  conditions:
+                    - evaluator: {type: gt, params: [0.05]}
+            noDataState: OK
+            execErrState: OK
+            for: 1m
+            labels:
+              severity: critical
+              service: auth-service
+              team: togglemaster
+              remediation: restart-deployment
+              deployment: auth-service
+            annotations:
+              summary: 'auth-service: taxa de erros 5xx acima de 5% ha mais de 1 minuto'
+              description: 'A taxa de respostas 5xx do auth-service passou de 5% (com trafego minimo). Self-healing: rollout restart do deployment/auth-service.'
