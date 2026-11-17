@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: auth-service
-          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/auth-service:v1.0.0-4de9ddf
+          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/auth-service:v1.0.0-13496d7
           ports:
             - containerPort: 8001
           resources:
@@ -60,7 +60,7 @@ spec:
     spec:
       containers:
         - name: flag-service
-          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/flag-service:v1.0.0-a0fb013
+          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/flag-service:v1.0.0-d40bcee
           ports:
             - containerPort: 8002
           resources:
@@ -105,7 +105,7 @@ spec:
     spec:
       containers:
         - name: targeting-service
-          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/targeting-service:v1.0.0-a0fb013
+          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/targeting-service:v1.0.0-d40bcee
           ports:
             - containerPort: 8003
           resources:
@@ -150,7 +150,7 @@ spec:
     spec:
       containers:
         - name: evaluation-service
-          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/evaluation-service:v1.0.0-a0fb013
+          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/evaluation-service:v1.0.0-13496d7
           ports:
             - containerPort: 8004
           resources:
@@ -201,7 +201,7 @@ spec:
     spec:
       containers:
         - name: analytics-service
-          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/analytics-service:v1.0.0-1627eb5
+          image: 329971370976.dkr.ecr.us-east-1.amazonaws.com/analytics-service:v1.0.0-d40bcee
           ports:
             - containerPort: 8005
           resources:
