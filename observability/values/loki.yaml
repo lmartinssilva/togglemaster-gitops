@@ -35,3 +35,9 @@ chunksCache: { enabled: false }
 resultsCache: { enabled: false }
 lokiCanary: { enabled: false }
 test: { enabled: false }
+
+# Modo monolitico: zera os alvos "simple scalable" (o chart recusa os dois ao mesmo tempo)
+backend: { replicas: 0 }
+read: { replicas: 0 }
+write: { replicas: 0 }
+minio: { enabled: false }
